@@ -14,24 +14,32 @@ import numpy as np
 class TextVideoDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
         metadata = pd.read_csv(metadata_path)
+        # Regular video paths
         self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
+        # UV video paths - replace 'train' with 'train_uv' and add '_uv.mp4' suffix
+        self.uv_path = []
+        for file_name in metadata["file_name"]:
+            base_name = os.path.splitext(file_name)[0]  # Remove extension
+            uv_file = f"{base_name}_uv.mp4"  # Add _uv.mp4
+            self.uv_path.append(os.path.join(base_path, "train_uv", uv_file))
+
         self.text = metadata["text"].to_list()
-        
+
         self.max_num_frames = max_num_frames
         self.frame_interval = frame_interval
         self.num_frames = num_frames
         self.height = height
         self.width = width
         self.is_i2v = is_i2v
-            
+
         self.frame_process = v2.Compose([
             v2.CenterCrop(size=(height, width)),
             v2.Resize(size=(height, width), antialias=True),
             v2.ToTensor(),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
-        
-        
+
+
     def crop_and_resize(self, image):
         width, height = image.size
         scale = max(self.width / width, self.height / height)
@@ -48,7 +56,7 @@ class TextVideoDataset(torch.utils.data.Dataset):
         if reader.count_frames() < max_num_frames or reader.count_frames() - 1 < start_frame_id + (num_frames - 1) * interval:
             reader.close()
             return None
-        
+
         frames = []
         first_frame = None
         for frame_id in range(num_frames):
@@ -63,7 +71,7 @@ class TextVideoDataset(torch.utils.data.Dataset):
 
         frames = torch.stack(frames, dim=0)
         frames = rearrange(frames, "T C H W -> C T H W")
-        
+
         first_frame = v2.functional.center_crop(first_frame, output_size=(self.height, self.width))
         first_frame = np.array(first_frame)
 
@@ -77,15 +85,15 @@ class TextVideoDataset(torch.utils.data.Dataset):
         start_frame_id = torch.randint(0, self.max_num_frames - (self.num_frames - 1) * self.frame_interval, (1,))[0]
         frames = self.load_frames_using_imageio(file_path, self.max_num_frames, start_frame_id, self.frame_interval, self.num_frames, self.frame_process)
         return frames
-    
-    
+
+
     def is_image(self, file_path):
         file_ext_name = file_path.split(".")[-1]
         if file_ext_name.lower() in ["jpg", "jpeg", "png", "webp"]:
             return True
         return False
-    
-    
+
+
     def load_image(self, file_path):
         frame = Image.open(file_path).convert("RGB")
         frame = self.crop_and_resize(frame)
@@ -98,19 +106,40 @@ class TextVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, data_id):
         text = self.text[data_id]
         path = self.path[data_id]
+        uv_path = self.uv_path[data_id]
+
+        # Load regular video
         if self.is_image(path):
             if self.is_i2v:
                 raise ValueError(f"{path} is not a video. I2V model doesn't support image-to-image training.")
             video = self.load_image(path)
         else:
             video = self.load_video(path)
+
+        # Load UV video
+        if self.is_image(uv_path):
+            uv_video = self.load_image(uv_path)
+        else:
+            uv_video = self.load_video(uv_path)
+
         if self.is_i2v:
             video, first_frame = video
-            data = {"text": text, "video": video, "path": path, "first_frame": first_frame}
+            data = {
+                "text": text, 
+                "video": video, 
+                "uv_video": uv_video,  # Add UV video
+                "path": path, 
+                "first_frame": first_frame
+            }
         else:
-            data = {"text": text, "video": video, "path": path}
+            data = {
+                "text": text, 
+                "video": video, 
+                "uv_video": uv_video,  # Add UV video
+                "path": path
+            }
         return data
-    
+
 
     def __len__(self):
         return len(self.path)
@@ -127,17 +156,20 @@ class LightningModelForDataProcess(pl.LightningModule):
         self.pipe = WanVideoPipeline.from_model_manager(model_manager)
 
         self.tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
-        
+
     def test_step(self, batch, batch_idx):
-        text, video, path = batch["text"][0], batch["video"], batch["path"][0]
-        
+        text, video, uv_video, path = batch["text"][0], batch["video"], batch["uv_video"], batch["path"][0]
+
         self.pipe.device = self.device
-        if video is not None:
+        if video is not None and uv_video is not None:
             # prompt
             prompt_emb = self.pipe.encode_prompt(text)
             # video
             video = video.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
             latents = self.pipe.encode_video(video, **self.tiler_kwargs)[0]
+            # uv video
+            uv_video = uv_video.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+            uv_latents = self.pipe.encode_video(uv_video, **self.tiler_kwargs)[0]
             # image
             if "first_frame" in batch:
                 first_frame = Image.fromarray(batch["first_frame"][0].cpu().numpy())
@@ -145,7 +177,12 @@ class LightningModelForDataProcess(pl.LightningModule):
                 image_emb = self.pipe.encode_image(first_frame, None, num_frames, height, width)
             else:
                 image_emb = {}
-            data = {"latents": latents, "prompt_emb": prompt_emb, "image_emb": image_emb}
+            data = {
+                "latents": latents,
+                "uv_latents": uv_latents,  # Add UV latents
+                "prompt_emb": prompt_emb,
+                "image_emb": image_emb
+            }
             torch.save(data, path + ".tensors.pth")
 
 
@@ -157,7 +194,7 @@ class TensorDataset(torch.utils.data.Dataset):
         self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
         print(len(self.path), "tensors cached in metadata.")
         assert len(self.path) > 0
-        
+
         self.steps_per_epoch = steps_per_epoch
 
 
@@ -167,40 +204,10 @@ class TensorDataset(torch.utils.data.Dataset):
         path = self.path[data_id]
         data = torch.load(path, weights_only=True, map_location="cpu")
         return data
-    
+
 
     def __len__(self):
         return self.steps_per_epoch
-    
-    
-class DummyTensorDataset(torch.utils.data.Dataset):
-    def __init__(self, steps_per_epoch=100):
-        # metadata = pd.read_csv(metadata_path)
-        # self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
-        # print(len(self.path), "videos in metadata.")
-        # self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
-        # print(len(self.path), "tensors cached in metadata.")
-        # assert len(self.path) > 0
-        
-        self.steps_per_epoch = steps_per_epoch
-
-
-    def __getitem__(self, index):
-        # data_id = torch.randint(0, len(self.path), (1,))[0]
-        # data_id = (data_id + index) % len(self.path) # For fixed seed.
-        # path = self.path[data_id]
-        # data = torch.load(path, weights_only=True, map_location="cpu")
-        data = {
-            'prompt_emb': {'context': torch.randn(1, 512, 4096)},
-            'latents': torch.randn(16, 20, 60, 104), # z = [b,c,t,h,w]
-            'image_emb': {},
-        }
-        return data
-    
-
-    def __len__(self):
-        return self.steps_per_epoch
-
 
 class LightningModelForTrain(pl.LightningModule):
     def __init__(
@@ -218,7 +225,7 @@ class LightningModelForTrain(pl.LightningModule):
         else:
             dit_path = dit_path.split(",")
             model_manager.load_models([dit_path])
-        
+
         self.pipe = WanVideoPipeline.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.freeze_parameters()
@@ -233,7 +240,7 @@ class LightningModelForTrain(pl.LightningModule):
             )
         else:
             self.pipe.denoising_model().requires_grad_(True)
-        
+
         ## Freeze self_attn parameters
         for name, param in self.pipe.denoising_model().named_parameters():
             if 'self_attn' in name:
@@ -243,25 +250,25 @@ class LightningModelForTrain(pl.LightningModule):
 
         for name, param in self.pipe.denoising_model().named_parameters():
             print(name, param.shape, param.requires_grad)
-        
+
         self.learning_rate = learning_rate
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
-        
-        
+
+
     def freeze_parameters(self):
         # Freeze parameters
         self.pipe.requires_grad_(False)
         self.pipe.eval()
         self.pipe.denoising_model().train()
-        
-        
+
+
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None):
         # Add LoRA to UNet
         self.lora_alpha = lora_alpha
         if init_lora_weights == "kaiming":
             init_lora_weights = True
-            
+
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -273,7 +280,7 @@ class LightningModelForTrain(pl.LightningModule):
             # Upcast LoRA parameters into fp32
             if param.requires_grad:
                 param.data = param.to(torch.float32)
-                
+
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
             state_dict = load_state_dict(pretrained_lora_path)
@@ -284,11 +291,13 @@ class LightningModelForTrain(pl.LightningModule):
             num_updated_keys = len(all_keys) - len(missing_keys)
             num_unexpected_keys = len(unexpected_keys)
             print(f"{num_updated_keys} parameters are loaded from {pretrained_lora_path}. {num_unexpected_keys} parameters are unexpected.")
-    
+
 
     def training_step(self, batch, batch_idx):
         # Data
         latents = batch["latents"].to(self.device)
+        # Get UV latents
+        uv_latents = batch["uv_latents"].to(self.device)
         prompt_emb = batch["prompt_emb"]
         prompt_emb["context"] = prompt_emb["context"][0].to(self.device)
         image_emb = batch["image_emb"]
@@ -305,10 +314,12 @@ class LightningModelForTrain(pl.LightningModule):
         extra_input = self.pipe.prepare_extra_input(latents)
         noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
-
+        
+        noisy_and_uv_latents = torch.cat([noisy_latents, uv_latents], dim=1)
+        
         # Compute loss
         noise_pred = self.pipe.denoising_model()(
-            noisy_latents, timestep=timestep, **prompt_emb, **extra_input, **image_emb,
+            noisy_and_uv_latents, timestep=timestep, **prompt_emb, **extra_input, **image_emb,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
         )
@@ -324,7 +335,7 @@ class LightningModelForTrain(pl.LightningModule):
         trainable_modules = filter(lambda p: p.requires_grad, self.pipe.denoising_model().parameters())
         optimizer = torch.optim.AdamW(trainable_modules, lr=self.learning_rate)
         return optimizer
-    
+
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint.clear()
@@ -568,17 +579,15 @@ def data_process(args):
         default_root_dir=args.output_path,
     )
     trainer.test(model, dataloader)
-    
-    
+
+
 def train(args):
-    # dataset = TensorDataset(
-    #     args.dataset_path,
-    #     os.path.join(args.dataset_path, "metadata.csv"),
-    #     steps_per_epoch=args.steps_per_epoch,
-    # )
-    dataset = DummyTensorDataset(
-        steps_per_epoch=args.steps_per_epoch,
+    dataset = TensorDataset(
+         args.dataset_path,
+         os.path.join(args.dataset_path, "metadata.csv"),
+         steps_per_epoch=args.steps_per_epoch,
     )
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=True,
