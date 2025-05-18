@@ -20,8 +20,9 @@ class TextVideoDataset(torch.utils.data.Dataset):
         self.uv_path = []
         for file_name in metadata["file_name"]:
             base_name = os.path.splitext(file_name)[0]  # Remove extension
-            uv_file = f"{base_name}.mp4"  
+            uv_file = f"{base_name}.mp4"  # Add _uv.mp4
             self.uv_path.append(os.path.join(base_path, "train_uv", uv_file))
+        print(self.uv_path)
 
         self.text = metadata["text"].to_list()
 
