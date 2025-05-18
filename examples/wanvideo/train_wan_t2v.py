@@ -315,8 +315,7 @@ class LightningModelForTrain(pl.LightningModule):
         noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
         training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
         
-        import ipdb; ipdb.set_trace()
-        noisy_and_uv_latents = torch.cat([noisy_latents, uv_latents], dim=1)
+        noisy_and_uv_latents = noisy_latents + uv_latents
         
         # Compute loss
         noise_pred = self.pipe.denoising_model()(
